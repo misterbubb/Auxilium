@@ -120,6 +120,11 @@ namespace Vertigo2Multiplayer
             Plugin.Log.LogInfo($"[ENEMY SYNC] Registered remote player entity for {steamId}");
         }
 
+        public RemotePlayerEntity GetRemotePlayerEntity(CSteamID steamId)
+        {
+            return _remotePlayerEntities.TryGetValue(steamId, out var entity) ? entity : null;
+        }
+
         /// <summary>
         /// Remove remote player entity when they disconnect
         /// </summary>
@@ -332,9 +337,10 @@ namespace Vertigo2Multiplayer
                     data.Enemy.transform.position, position, Time.deltaTime * 10f);
                 data.Enemy.transform.rotation = Quaternion.Slerp(
                     data.Enemy.transform.rotation, rotation, Time.deltaTime * 10f);
-                
-                // Update health directly (could trigger damage effects)
-                // data.Enemy.health = health; // Can't set directly, would need reflection
+
+                // Health is a public field on VertigoEntity. The host owns combat
+                // results; clients mirror that value and receive a separate death event.
+                data.Enemy.health = health;
             }
         }
 

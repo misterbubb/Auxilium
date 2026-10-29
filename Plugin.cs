@@ -74,6 +74,7 @@ namespace Vertigo2Multiplayer
             networkObj.AddComponent<PlayerManager>();
             networkObj.AddComponent<InteractableSync>();
             networkObj.AddComponent<InventorySync>();
+            networkObj.AddComponent<WeaponSync>();
             networkObj.AddComponent<EnemySync>();
             networkObj.AddComponent<StorySync>();
             networkObj.AddComponent<WorldSync>();

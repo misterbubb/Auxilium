@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.IO;
 using Steamworks;
 using UnityEngine;
+using Vertigo2.Interaction;
 
 namespace Vertigo2Multiplayer
 {
@@ -26,7 +27,7 @@ namespace Vertigo2Multiplayer
         HeadTransform = 20,
         LeftHandTransform = 21,
         RightHandTransform = 22,
-        HandGrip = 23, // Finger curl values for both hands
+        HandGrip = 23, // Legacy finger curl values for both hands
         
         // Game events
         PlayerDamage = 30,
@@ -39,6 +40,10 @@ namespace Vertigo2Multiplayer
         WeaponReload = 52,
         WeaponEquip = 53, // Which weapon is equipped in which hand
         WeaponPickup = 54, // Weapon picked up - sync to all players
+        RequestWeaponState = 55, // Ask peers to send their current equipped weapons
+        ProjectileSpawn = 56, // Replicated player projectile; only the host applies damage
+        WeaponAmmo = 57, // Current ammunition state for an equipped weapon
+        HandPose = 58, // Final weapon-aware local bone poses for both hands
         
         // Scene sync
         SceneChange = 60,
@@ -96,6 +101,7 @@ namespace Vertigo2Multiplayer
         private const int QUATERNION_SIZE = 16; // 4 floats
         private const int FULL_VR_TRANSFORM_SIZE = 1 + (VECTOR3_SIZE * 4) + (QUATERNION_SIZE * 3); // 93 bytes
         private const int HAND_GRIP_SIZE = 1 + (10 * 4); // 41 bytes (10 floats)
+        private const int HAND_POSE_SIZE = 1 + (2 * (HandPose.numBones - 1) * (3 + 4) * 4);
         private const int TRANSFORM_SIZE = 1 + VECTOR3_SIZE + QUATERNION_SIZE; // 29 bytes
         
         // Logging
@@ -122,12 +128,17 @@ namespace Vertigo2Multiplayer
             Register(PacketType.LeftHandTransform, HandleLeftHandTransform);
             Register(PacketType.RightHandTransform, HandleRightHandTransform);
             Register(PacketType.HandGrip, HandleHandGrip);
+            Register(PacketType.HandPose, HandleHandPose);
             Register(PacketType.PlayerDamage, HandlePlayerDamage);
             Register(PacketType.PlayerDeath, HandlePlayerDeath);
             Register(PacketType.PlayerRespawn, HandlePlayerRespawn);
             Register(PacketType.WeaponSwitch, HandleWeaponSwitch);
             Register(PacketType.WeaponFire, HandleWeaponFire);
+            Register(PacketType.WeaponReload, HandleWeaponReload);
+            Register(PacketType.ProjectileSpawn, HandleProjectileSpawn);
+            Register(PacketType.WeaponAmmo, HandleWeaponAmmo);
             Register(PacketType.WeaponEquip, HandleWeaponEquip);
+            Register(PacketType.RequestWeaponState, HandleRequestWeaponState);
             Register(PacketType.SceneChange, HandleSceneChange);
             Register(PacketType.SceneReady, HandleSceneReady);
             Register(PacketType.CharacterSelect, HandleCharacterSelect);
@@ -206,10 +217,15 @@ namespace Vertigo2Multiplayer
                 PacketType.LeftHandTransform => TRANSFORM_SIZE,
                 PacketType.RightHandTransform => TRANSFORM_SIZE,
                 PacketType.HandGrip => HAND_GRIP_SIZE,
+                PacketType.HandPose => HAND_POSE_SIZE,
                 PacketType.PlayerPosition => 1 + VECTOR3_SIZE,
                 PacketType.PlayerState => 1 + 4 + 4 + 1, // health, maxHealth, isDead
                 PacketType.PlayerDamage => 1 + 4 + VECTOR3_SIZE + 4 + 4, // damage, hitPoint, health, maxHealth
                 PacketType.PlayerRespawn => 1 + VECTOR3_SIZE,
+                PacketType.WeaponFire => 1 + 1 + (VECTOR3_SIZE * 2), // string length prefix, position, direction
+                PacketType.ProjectileSpawn => 1 + 1 + 1 + (VECTOR3_SIZE * 2) + (4 * 4), // weapon, shooter index, transforms, multipliers, bullet speed
+                PacketType.WeaponAmmo => 1 + 1 + (4 * 2), // weapon, rounds, capacity
+                PacketType.WeaponReload => 1 + 1 + (4 * 2), // weapon, rounds, capacity
                 PacketType.EnemyState => 1 + 4 + VECTOR3_SIZE + QUATERNION_SIZE + 4, // id, pos, rot, health
                 PacketType.EnemyDeath => 1 + 4, // id
                 _ => MIN_PACKET_SIZE // For string-based packets, just require the type byte
@@ -399,14 +415,51 @@ namespace Vertigo2Multiplayer
         private static void HandleWeaponFire(BinaryReader reader, CSteamID sender)
         {
             string weaponId = reader.ReadString();
+            float posX = reader.ReadSingle();
+            float posY = reader.ReadSingle();
+            float posZ = reader.ReadSingle();
             float dirX = reader.ReadSingle();
             float dirY = reader.ReadSingle();
             float dirZ = reader.ReadSingle();
+            Vector3 position = new Vector3(posX, posY, posZ);
             Vector3 direction = new Vector3(dirX, dirY, dirZ);
             
-            Plugin.Log.LogInfo($"[WEAPON RECV] WeaponFire from {sender}: {weaponId} dir={direction}");
-            PlayerManager.Instance?.HandleRemotePlayerFire(sender, weaponId, direction);
+            Plugin.Log.LogInfo($"[WEAPON RECV] WeaponFire from {sender}: {weaponId} pos={position} dir={direction}");
+            PlayerManager.Instance?.HandleRemotePlayerFire(sender, weaponId, position, direction);
         }
+
+        private static void HandleWeaponReload(BinaryReader reader, CSteamID sender)
+        {
+            string weaponId = reader.ReadString();
+            int rounds = reader.ReadInt32();
+            int capacity = reader.ReadInt32();
+            WeaponSync.Instance?.HandleRemoteAmmo(sender, weaponId, rounds, capacity, reloaded: true);
+        }
+
+        private static void HandleWeaponAmmo(BinaryReader reader, CSteamID sender)
+        {
+            string weaponId = reader.ReadString();
+            int rounds = reader.ReadInt32();
+            int capacity = reader.ReadInt32();
+            WeaponSync.Instance?.HandleRemoteAmmo(sender, weaponId, rounds, capacity, reloaded: false);
+        }
+
+        private static void HandleProjectileSpawn(BinaryReader reader, CSteamID sender)
+        {
+            string weaponId = reader.ReadString();
+            byte shooterIndex = reader.ReadByte();
+            Vector3 position = new Vector3(reader.ReadSingle(), reader.ReadSingle(), reader.ReadSingle());
+            Vector3 direction = new Vector3(reader.ReadSingle(), reader.ReadSingle(), reader.ReadSingle());
+            float powerMultiplier = reader.ReadSingle();
+            float speedMultiplier = reader.ReadSingle();
+            float rangeMultiplier = reader.ReadSingle();
+            float bulletSpeed = reader.ReadSingle();
+
+            WeaponSync.Instance?.HandleProjectileSpawn(sender, weaponId, shooterIndex,
+                position, direction, powerMultiplier, speedMultiplier, rangeMultiplier,
+                bulletSpeed);
+        }
+
 
         private static void HandleSceneChange(BinaryReader reader, CSteamID sender)
         {
@@ -442,6 +495,59 @@ namespace Vertigo2Multiplayer
                 rThumb, rIndex, rMiddle, rRing, rPinky);
         }
 
+        private static void HandleHandPose(BinaryReader reader, CSteamID sender)
+        {
+            var left = new RemotePlayer.FingerBonePose[HandPose.numBones];
+            var right = new RemotePlayer.FingerBonePose[HandPose.numBones];
+
+            if (!ReadFingerBones(reader, left) || !ReadFingerBones(reader, right))
+            {
+                Plugin.Log.LogWarning($"[HAND POSE] Ignored invalid hand pose from {sender}");
+                return;
+            }
+
+            PlayerManager.Instance?.UpdateRemotePlayerHandPose(sender, left, right);
+        }
+
+        private static bool ReadFingerBones(BinaryReader reader, RemotePlayer.FingerBonePose[] bones)
+        {
+            for (int i = 1; i < HandPose.numBones; i++)
+            {
+                var position = new Vector3(reader.ReadSingle(), reader.ReadSingle(), reader.ReadSingle());
+                var rotation = new Quaternion(reader.ReadSingle(), reader.ReadSingle(),
+                    reader.ReadSingle(), reader.ReadSingle());
+
+                if (!IsFinite(position) || !IsFinite(rotation) || position.sqrMagnitude > 1f)
+                    return false;
+
+                float magnitude = Mathf.Sqrt(rotation.x * rotation.x + rotation.y * rotation.y +
+                    rotation.z * rotation.z + rotation.w * rotation.w);
+                if (magnitude < 0.001f)
+                    return false;
+
+                bones[i].LocalPosition = position;
+                bones[i].LocalRotation = new Quaternion(rotation.x / magnitude,
+                    rotation.y / magnitude, rotation.z / magnitude, rotation.w / magnitude);
+            }
+
+            return true;
+        }
+
+        private static bool IsFinite(Quaternion value)
+        {
+            return IsFinite(value.x) && IsFinite(value.y) && IsFinite(value.z) && IsFinite(value.w);
+        }
+
+        private static bool IsFinite(Vector3 value)
+        {
+            return IsFinite(value.x) && IsFinite(value.y) && IsFinite(value.z);
+        }
+
+        private static bool IsFinite(float value)
+        {
+            return !float.IsNaN(value) && !float.IsInfinity(value);
+        }
+
         private static void HandleWeaponEquip(BinaryReader reader, CSteamID sender)
         {
             string leftWeaponId = reader.ReadString();
@@ -449,6 +555,13 @@ namespace Vertigo2Multiplayer
             
             Plugin.Log.LogInfo($"[WEAPON RECV] WeaponEquip from {sender}: L={leftWeaponId}, R={rightWeaponId}");
             PlayerManager.Instance?.UpdateRemotePlayerWeapons(sender, leftWeaponId, rightWeaponId);
+        }
+
+        private static void HandleRequestWeaponState(BinaryReader reader, CSteamID sender)
+        {
+            // Only a client should answer the host's loadout snapshot request.
+            if (NetworkManager.Instance?.IsHost == true) return;
+            PlayerManager.Instance?.SendCurrentWeaponState();
         }
 
         private static void HandleSceneReady(BinaryReader reader, CSteamID sender)

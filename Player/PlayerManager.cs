@@ -35,8 +35,8 @@ namespace Vertigo2Multiplayer
         private const int UPDATE_LOG_INTERVAL = 60;
         private const int UPDATE_WARNING_INTERVAL = 30;
         
-        // Grip/weapon send intervals (in frames)
-        private const int GRIP_SEND_INTERVAL = 2;
+        // Hand pose/weapon send intervals (in sync ticks)
+        private const int HAND_POSE_SEND_INTERVAL = 1;
         private const int WEAPON_SEND_INTERVAL = 10;
 
         #endregion
@@ -336,10 +336,13 @@ namespace Vertigo2Multiplayer
             Vector3 rootPos = LocalPlayerRoot?.position ?? Vector3.zero;
             Vector3 headPos = LocalHead?.position ?? rootPos;
             Quaternion headRot = LocalHead?.rotation ?? Quaternion.identity;
-            Vector3 leftHandPos = LocalLeftHand?.position ?? headPos;
-            Quaternion leftHandRot = LocalLeftHand?.rotation ?? Quaternion.identity;
-            Vector3 rightHandPos = LocalRightHand?.position ?? headPos;
-            Quaternion rightHandRot = LocalRightHand?.rotation ?? Quaternion.identity;
+            var bodyAnimator = LocalPlayer?.GetComponentInChildren<BodyAnimator>(true);
+            Transform leftHandSource = bodyAnimator?.handLeft?.handTarget ?? LocalLeftHand;
+            Transform rightHandSource = bodyAnimator?.handRight?.handTarget ?? LocalRightHand;
+            Vector3 leftHandPos = leftHandSource?.position ?? headPos;
+            Quaternion leftHandRot = leftHandSource?.rotation ?? Quaternion.identity;
+            Vector3 rightHandPos = rightHandSource?.position ?? headPos;
+            Quaternion rightHandRot = rightHandSource?.rotation ?? Quaternion.identity;
             
             // Debug: Log position updates periodically (every 5 seconds at 30Hz = every 150 frames)
             if (_syncLogCounter % POSITION_LOG_INTERVAL == 0)
@@ -347,8 +350,12 @@ namespace Vertigo2Multiplayer
                 Plugin.Log.LogInfo($"[SYNC] ===== SENDING LOCAL TRANSFORMS (frame {_syncLogCounter}) =====");
                 Plugin.Log.LogInfo($"[SYNC] Root: {rootPos}");
                 Plugin.Log.LogInfo($"[SYNC] Head: pos={headPos}, rot={headRot.eulerAngles}");
-                Plugin.Log.LogInfo($"[SYNC] LHand: pos={leftHandPos}, rot={leftHandRot.eulerAngles}");
-                Plugin.Log.LogInfo($"[SYNC] RHand: pos={rightHandPos}, rot={rightHandRot.eulerAngles}");
+                Plugin.Log.LogInfo($"[SYNC] LHand target: pos={leftHandPos}, rot={leftHandRot.eulerAngles}");
+                Plugin.Log.LogInfo($"[SYNC] RHand target: pos={rightHandPos}, rot={rightHandRot.eulerAngles}");
+                if (LocalLeftHand != null && leftHandSource != null)
+                    Plugin.Log.LogInfo($"[SYNC] Left controller-to-rig rotation offset: {Quaternion.Angle(LocalLeftHand.rotation, leftHandSource.rotation):F1} deg");
+                if (LocalRightHand != null && rightHandSource != null)
+                    Plugin.Log.LogInfo($"[SYNC] Right controller-to-rig rotation offset: {Quaternion.Angle(LocalRightHand.rotation, rightHandSource.rotation):F1} deg");
                 Plugin.Log.LogInfo($"[SYNC] LocalLeftHand null? {LocalLeftHand == null}, LocalRightHand null? {LocalRightHand == null}");
                 Plugin.Log.LogInfo($"[SYNC] Connected players: {NetworkManager.Instance?.ConnectedPlayers?.Count ?? 0}");
             }
@@ -359,79 +366,48 @@ namespace Vertigo2Multiplayer
                 rightHandPos, rightHandRot);
             NetworkManager.Instance.Broadcast(packet, reliable: false);
             
-            // Send grip state (every other frame to reduce bandwidth)
-            if (_syncLogCounter % GRIP_SEND_INTERVAL == 0)
+            // Send final finger bones at the same 30 Hz rate as the hand rig.
+            if (_syncLogCounter % HAND_POSE_SEND_INTERVAL == 0)
             {
-                SendGripState();
+                SendHandPose();
             }
             
             // Send weapon state (less frequently)
             if (_syncLogCounter % WEAPON_SEND_INTERVAL == 0)
             {
                 SendWeaponState();
+                WeaponSync.Instance?.SyncLocalAmmoState();
             }
             
             _syncLogCounter++;
         }
         
-        /// <summary>
-        /// Send current hand grip/finger curl state
-        /// </summary>
-        private void SendGripState()
+        /// <summary>Send the game's final finger bones after SteamVR and weapon posing.</summary>
+        private void SendHandPose()
         {
             if (LocalPlayer == null) return;
-            
-            // Try to get finger curl values from SteamVR skeleton actions
-            float lThumb = 0f, lIndex = 0f, lMiddle = 0f, lRing = 0f, lPinky = 0f;
-            float rThumb = 0f, rIndex = 0f, rMiddle = 0f, rRing = 0f, rPinky = 0f;
-            bool gotLeftSkeleton = false;
-            bool gotRightSkeleton = false;
-            
+
             try
             {
-                // Get skeleton actions from SteamVR
-                var leftSkeleton = Valve.VR.SteamVR_Actions._default.SkeletonLeftHand;
-                var rightSkeleton = Valve.VR.SteamVR_Actions._default.SkeletonRightHand;
-                
-                if (leftSkeleton != null && leftSkeleton.active)
-                {
-                    lThumb = leftSkeleton.thumbCurl;
-                    lIndex = leftSkeleton.indexCurl;
-                    lMiddle = leftSkeleton.middleCurl;
-                    lRing = leftSkeleton.ringCurl;
-                    lPinky = leftSkeleton.pinkyCurl;
-                    gotLeftSkeleton = true;
-                }
-                
-                if (rightSkeleton != null && rightSkeleton.active)
-                {
-                    rThumb = rightSkeleton.thumbCurl;
-                    rIndex = rightSkeleton.indexCurl;
-                    rMiddle = rightSkeleton.middleCurl;
-                    rRing = rightSkeleton.ringCurl;
-                    rPinky = rightSkeleton.pinkyCurl;
-                    gotRightSkeleton = true;
-                }
-                
-                // Log grip state periodically
+                var bodyAnimator = LocalPlayer.GetComponentInChildren<BodyAnimator>(true);
+                var leftBones = bodyAnimator?.handLeft?.animator?.bones;
+                var rightBones = bodyAnimator?.handRight?.animator?.bones;
+                int boneCount = Vertigo2.Interaction.HandPose.numBones;
+                if (leftBones == null || rightBones == null ||
+                    leftBones.Length < boneCount || rightBones.Length < boneCount) return;
+
                 if (_gripLogCounter++ % 60 == 0)
-                {
-                    Plugin.Log.LogInfo($"[GRIP SEND] Left skeleton active: {gotLeftSkeleton}, Right skeleton active: {gotRightSkeleton}");
-                    Plugin.Log.LogInfo($"[GRIP SEND] L({lThumb:F2},{lIndex:F2},{lMiddle:F2},{lRing:F2},{lPinky:F2}) R({rThumb:F2},{rIndex:F2},{rMiddle:F2},{rRing:F2},{rPinky:F2})");
-                }
+                    Plugin.Log.LogInfo("[HAND POSE SEND] Sending final local finger transforms for both hands");
+
+                NetworkManager.Instance.Broadcast(PacketBuilder.HandPose(leftBones, rightBones), reliable: false);
             }
             catch (System.Exception ex)
             {
-                // Skeleton actions not available, use default values
                 if (_gripLogCounter++ % 300 == 0)
                 {
-                    Plugin.Log.LogWarning($"[GRIP SEND] Failed to get skeleton data: {ex.Message}");
+                    Plugin.Log.LogWarning($"[HAND POSE SEND] Failed to read the local hand rig: {ex.Message}");
                 }
             }
-            
-            var packet = PacketBuilder.HandGrip(lThumb, lIndex, lMiddle, lRing, lPinky,
-                                                rThumb, rIndex, rMiddle, rRing, rPinky);
-            NetworkManager.Instance.Broadcast(packet, reliable: false);
         }
         
         private int _gripLogCounter = 0;
@@ -439,7 +415,7 @@ namespace Vertigo2Multiplayer
         /// <summary>
         /// Send current equipped weapon state
         /// </summary>
-        private void SendWeaponState()
+        private void SendWeaponState(bool force = false, CSteamID? targetPlayer = null)
         {
             if (LocalPlayer == null) return;
             
@@ -466,18 +442,29 @@ namespace Vertigo2Multiplayer
             }
             
             // Only send if changed
-            if (leftWeapon != _lastLeftWeapon || rightWeapon != _lastRightWeapon)
+            if (force || leftWeapon != _lastLeftWeapon || rightWeapon != _lastRightWeapon)
             {
                 _lastLeftWeapon = leftWeapon;
                 _lastRightWeapon = rightWeapon;
                 
                 var packet = PacketBuilder.WeaponEquip(leftWeapon, rightWeapon);
-                NetworkManager.Instance.Broadcast(packet, reliable: true);
+                if (targetPlayer.HasValue)
+                    NetworkManager.Instance.SendTo(targetPlayer.Value, packet, reliable: true);
+                else
+                    NetworkManager.Instance.Broadcast(packet, reliable: true);
                 
-                Plugin.Log.LogInfo($"[WEAPON] Sending weapon state: L={leftWeapon}, R={rightWeapon}");
+                string destination = targetPlayer.HasValue ? $" to {targetPlayer.Value}" : " to lobby";
+                Plugin.Log.LogInfo($"[WEAPON] Sending weapon state{destination}: L={leftWeapon}, R={rightWeapon}");
+                if (!targetPlayer.HasValue)
+                    WeaponSync.Instance?.SendCurrentAmmoState();
             }
         }
         
+        public void SendCurrentWeaponState()
+        {
+            SendWeaponState(force: true);
+        }
+
         private string _lastLeftWeapon = "none";
         private string _lastRightWeapon = "none";
         
@@ -545,6 +532,40 @@ namespace Vertigo2Multiplayer
             
             // Send current position immediately so they see us right away
             SendLocalPlayerState();
+
+            // Send the current loadout for this peer. The periodic change detector
+            // won't resend an unchanged loadout to someone who just joined.
+            StartCoroutine(SendWeaponStateAfterJoin(steamId));
+        }
+
+        private System.Collections.IEnumerator SendWeaponStateAfterJoin(CSteamID joiningPlayer)
+        {
+            const int maxAttempts = 20;
+            const float retryDelay = 0.25f;
+
+            for (int attempt = 0; attempt < maxAttempts; attempt++)
+            {
+                if (NetworkManager.Instance?.IsConnected == true && LocalPlayer?.equippablesManager != null)
+                {
+                    // Hosts send the snapshot directly to the new peer. Clients
+                    // send theirs to the host, which relays it to the lobby.
+                    if (NetworkManager.Instance.IsHost)
+                    {
+                        SendWeaponState(force: true, targetPlayer: joiningPlayer);
+                        WeaponSync.Instance?.SendCurrentAmmoState(joiningPlayer);
+                        NetworkManager.Instance.Broadcast(PacketBuilder.RequestWeaponState(), reliable: true);
+                    }
+                    else
+                    {
+                        SendWeaponState(force: true);
+                    }
+                    yield break;
+                }
+
+                yield return new WaitForSecondsRealtime(retryDelay);
+            }
+
+            Plugin.Log.LogWarning("[WEAPON] Skipped join snapshot: local equippables were not ready");
         }
         
         /// <summary>
@@ -792,12 +813,29 @@ namespace Vertigo2Multiplayer
             }
         }
 
-        public void HandleRemotePlayerFire(CSteamID steamId, string weaponId, Vector3 direction)
+        public bool IsRemoteWeaponEquipped(CSteamID steamId, string weaponId)
+        {
+            return _remotePlayers.TryGetValue(steamId, out var player) &&
+                   player.HasEquippedWeapon(weaponId);
+        }
+
+        public void UpdateRemoteWeaponAmmo(CSteamID steamId, string weaponId, int rounds, int capacity, bool reloaded)
+        {
+            if (_remotePlayers.TryGetValue(steamId, out var player))
+            {
+                player.UpdateWeaponAmmo(weaponId, rounds, capacity);
+                Plugin.Log.LogInfo($"[AMMO] {player.PlayerName} {weaponId}: {rounds}/{capacity}");
+                if (reloaded)
+                    Plugin.Log.LogInfo($"[RELOAD] {player.PlayerName} reloaded {weaponId}: {rounds}/{capacity}");
+            }
+        }
+
+        public void HandleRemotePlayerFire(CSteamID steamId, string weaponId, Vector3 position, Vector3 direction)
         {
             if (_remotePlayers.TryGetValue(steamId, out var player))
             {
                 Plugin.Log.LogInfo($"[WEAPON] HandleRemotePlayerFire: {player.PlayerName} fired {weaponId}");
-                player.OnWeaponFire(weaponId, direction);
+                player.OnWeaponFire(weaponId, position, direction);
             }
             else
             {
@@ -910,32 +948,23 @@ namespace Vertigo2Multiplayer
         }
 
         /// <summary>
-        /// Update remote player's hand grip/finger curl values
+        /// Apply the final hand pose received from another player's local hand animators.
         /// </summary>
-        public void UpdateRemotePlayerGrip(CSteamID steamId, 
+        public void UpdateRemotePlayerGrip(CSteamID steamId,
             float lThumb, float lIndex, float lMiddle, float lRing, float lPinky,
             float rThumb, float rIndex, float rMiddle, float rRing, float rPinky)
         {
             if (_remotePlayers.TryGetValue(steamId, out var player))
-            {
-                // Log periodically
-                if (_gripRecvLogCounter++ % 60 == 0)
-                {
-                    Plugin.Log.LogInfo($"[GRIP ROUTE] Routing grip to {player.PlayerName}: L({lThumb:F2},{lIndex:F2}) R({rThumb:F2},{rIndex:F2})");
-                }
                 player.SetGrip(lThumb, lIndex, lMiddle, lRing, lPinky,
-                              rThumb, rIndex, rMiddle, rRing, rPinky);
-            }
-            else
-            {
-                if (_gripRecvLogCounter++ % 60 == 0)
-                {
-                    Plugin.Log.LogWarning($"[GRIP ROUTE] No remote player found for {SteamFriends.GetFriendPersonaName(steamId)} ({steamId})");
-                }
-            }
+                    rThumb, rIndex, rMiddle, rRing, rPinky);
         }
-        
-        private int _gripRecvLogCounter = 0;
+
+        public void UpdateRemotePlayerHandPose(CSteamID steamId,
+            RemotePlayer.FingerBonePose[] left, RemotePlayer.FingerBonePose[] right)
+        {
+            if (_remotePlayers.TryGetValue(steamId, out var player))
+                player.SetHandPose(left, right);
+        }
 
         /// <summary>
         /// Update remote player's equipped weapons

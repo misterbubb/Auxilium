@@ -189,26 +189,62 @@ namespace Vertigo2Multiplayer
             return ToArrayAndReturn(ms);
         }
 
-        public static byte[] WeaponFire(string weaponId, Vector3 direction)
+        public static byte[] WeaponFire(string weaponId, Vector3 position, Vector3 direction)
         {
             var ms = GetStream();
             using var writer = new BinaryWriter(ms, System.Text.Encoding.UTF8, leaveOpen: true);
             
             writer.Write((byte)PacketType.WeaponFire);
             writer.Write(weaponId ?? "unknown");
+            WriteVector3(writer, position);
             WriteVector3(writer, direction);
             
             return ToArrayAndReturn(ms);
         }
 
-        public static byte[] WeaponReload(string weaponId)
+        public static byte[] WeaponReload(string weaponId, int rounds, int capacity)
         {
             var ms = GetStream();
             using var writer = new BinaryWriter(ms, System.Text.Encoding.UTF8, leaveOpen: true);
             
             writer.Write((byte)PacketType.WeaponReload);
             writer.Write(weaponId ?? "unknown");
+            writer.Write(rounds);
+            writer.Write(capacity);
             
+            return ToArrayAndReturn(ms);
+        }
+
+        public static byte[] WeaponAmmo(string weaponId, int rounds, int capacity)
+        {
+            var ms = GetStream();
+            using var writer = new BinaryWriter(ms, System.Text.Encoding.UTF8, leaveOpen: true);
+
+            writer.Write((byte)PacketType.WeaponAmmo);
+            writer.Write(weaponId ?? "unknown");
+            writer.Write(rounds);
+            writer.Write(capacity);
+
+            return ToArrayAndReturn(ms);
+        }
+
+        public static byte[] ProjectileSpawn(string weaponId, byte shooterIndex,
+            Vector3 position, Vector3 direction, float powerMultiplier,
+            float speedMultiplier, float rangeMultiplier, float bulletSpeed)
+        {
+            var ms = GetStream();
+            using var writer = new BinaryWriter(ms, System.Text.Encoding.UTF8, leaveOpen: true);
+
+            writer.Write((byte)PacketType.ProjectileSpawn);
+            writer.Write(weaponId ?? "unknown");
+            writer.Write(shooterIndex);
+            WriteVector3(writer, position);
+            WriteVector3(writer, direction);
+            writer.Write(powerMultiplier);
+            writer.Write(speedMultiplier);
+            writer.Write(rangeMultiplier);
+            writer.Write(bulletSpeed);
+
             return ToArrayAndReturn(ms);
         }
 
@@ -235,28 +271,31 @@ namespace Vertigo2Multiplayer
         }
 
         /// <summary>
-        /// Hand grip/finger curl packet - sends curl values for all 10 fingers.
+        /// Sends the full final local transforms for both hands so the remote rig
+        /// receives the authored finger articulation as well as its rotations.
         /// </summary>
-        public static byte[] HandGrip(float lThumb, float lIndex, float lMiddle, float lRing, float lPinky,
-            float rThumb, float rIndex, float rMiddle, float rRing, float rPinky)
+        public static byte[] HandPose(Transform[] leftBones, Transform[] rightBones)
         {
             var ms = GetStream();
             using var writer = new BinaryWriter(ms, System.Text.Encoding.UTF8, leaveOpen: true);
-            
-            writer.Write((byte)PacketType.HandGrip);
-            writer.Write(lThumb);
-            writer.Write(lIndex);
-            writer.Write(lMiddle);
-            writer.Write(lRing);
-            writer.Write(lPinky);
-            writer.Write(rThumb);
-            writer.Write(rIndex);
-            writer.Write(rMiddle);
-            writer.Write(rRing);
-            writer.Write(rPinky);
+
+            writer.Write((byte)PacketType.HandPose);
+            WriteFingerBones(writer, leftBones);
+            WriteFingerBones(writer, rightBones);
             
             return ToArrayAndReturn(ms);
         }
+
+        private static void WriteFingerBones(BinaryWriter writer, Transform[] bones)
+        {
+            for (int i = 1; i < Vertigo2.Interaction.HandPose.numBones; i++)
+            {
+                var bone = bones[i];
+                WriteVector3(writer, bone.localPosition);
+                WriteQuaternion(writer, bone.localRotation);
+            }
+        }
+
 
         /// <summary>
         /// Weapon equip packet - which weapons are in which hands.
@@ -271,6 +310,11 @@ namespace Vertigo2Multiplayer
             writer.Write(rightWeaponId ?? "none");
             
             return ToArrayAndReturn(ms);
+        }
+
+        public static byte[] RequestWeaponState()
+        {
+            return new[] { (byte)PacketType.RequestWeaponState };
         }
 
         /// <summary>

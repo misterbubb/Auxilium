@@ -726,6 +726,11 @@ namespace Vertigo2Multiplayer
                    type == PacketType.CharacterSelect ||
                    type == PacketType.SceneChange ||
                    type == PacketType.WeaponSwitch ||
+                   type == PacketType.WeaponEquip ||
+                   type == PacketType.WeaponReload ||
+                   type == PacketType.ProjectileSpawn ||
+                   type == PacketType.WeaponAmmo ||
+                   type == PacketType.RequestWeaponState ||
                    type == PacketType.WeaponPickup ||
                    type == PacketType.InteractableState;
         }

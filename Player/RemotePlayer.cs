@@ -1,9 +1,11 @@
 using RootMotion.FinalIK;
 using Steamworks;
+using System.Collections.Generic;
 using UnityEngine;
 using Valve.VR;
 using Vertigo2;
 using Vertigo2.Player;
+using Vertigo2.Weapons;
 
 namespace Vertigo2Multiplayer
 {
@@ -12,8 +14,15 @@ namespace Vertigo2Multiplayer
     /// Uses the game's VRIK IK system to animate the player body from synced head/hand positions.
     /// Falls back to primitive shapes if the real model can't be loaded.
     /// </summary>
+    [DefaultExecutionOrder(10000)]
     public class RemotePlayer : MonoBehaviour
     {
+        public struct FingerBonePose
+        {
+            public Vector3 LocalPosition;
+            public Quaternion LocalRotation;
+        }
+
         #region Constants
 
         // Layers
@@ -21,6 +30,7 @@ namespace Vertigo2Multiplayer
         
         // Interpolation
         private const float DEFAULT_INTERPOLATION_SPEED = 15f;
+        private const float HAND_POSE_INTERPOLATION_DELAY = 1f / 30f;
         
         // Logging intervals
         private const int SET_TARGET_LOG_INTERVAL = 60;
@@ -85,6 +95,19 @@ namespace Vertigo2Multiplayer
 
         private Vertigo2.Interaction.HandAnimator _leftHandAnimator;
         private Vertigo2.Interaction.HandAnimator _rightHandAnimator;
+        private readonly FingerBonePose[] _leftFingerPose =
+            new FingerBonePose[Vertigo2.Interaction.HandPose.numBones];
+        private readonly FingerBonePose[] _rightFingerPose =
+            new FingerBonePose[Vertigo2.Interaction.HandPose.numBones];
+        private readonly FingerBonePose[] _previousLeftFingerPose =
+            new FingerBonePose[Vertigo2.Interaction.HandPose.numBones];
+        private readonly FingerBonePose[] _previousRightFingerPose =
+            new FingerBonePose[Vertigo2.Interaction.HandPose.numBones];
+        private bool _hasNetworkHandPose;
+        private bool _hasPreviousNetworkHandPose;
+        private float _previousHandPoseTime;
+        private float _currentHandPoseTime;
+        private int _handPoseDiagnosticCounter;
         
         // Hand grip/finger curl values (0 = open, 1 = closed)
         private float _leftThumbCurl, _leftIndexCurl, _leftMiddleCurl, _leftRingCurl, _leftPinkyCurl;
@@ -116,6 +139,13 @@ namespace Vertigo2Multiplayer
         private string _rightWeaponId = "none";
         private GameObject _leftWeaponVisual;
         private GameObject _rightWeaponVisual;
+        private readonly Dictionary<string, RemoteWeaponAmmo> _weaponAmmo = new();
+
+        private struct RemoteWeaponAmmo
+        {
+            public int Rounds;
+            public int Capacity;
+        }
 
         #endregion
 
@@ -365,6 +395,15 @@ namespace Vertigo2Multiplayer
                 if (comp is SkinnedMeshRenderer) { keptCount++; continue; }
                 if (comp is MeshRenderer) { keptCount++; continue; }
                 if (comp is MeshFilter) { keptCount++; continue; }
+
+                // Retain the game's canonical bone ordering, but disable the
+                // component so it never reads this machine's local VR actions.
+                if (comp is Vertigo2.Interaction.HandAnimator handAnimator)
+                {
+                    handAnimator.enabled = false;
+                    keptCount++;
+                    continue;
+                }
                 
                 // Keep TwistRelaxer - it's part of the IK system
                 if (typeName == "TwistRelaxer") { keptCount++; continue; }
@@ -1026,16 +1065,14 @@ namespace Vertigo2Multiplayer
             _vrik.solver.spine.positionWeight = 1f;
             _vrik.solver.spine.rotationWeight = 1f;
             
-            // Arm settings - full position/rotation tracking
+            // Track the remote hands fully, but preserve the prefab's shoulder
+            // rotation/twist weights and per-side palm axes. Those values are
+            // authored for each character's mirrored left/right arm rig.
             _vrik.solver.leftArm.positionWeight = 1f;
             _vrik.solver.leftArm.rotationWeight = 1f;
-            _vrik.solver.leftArm.shoulderRotationWeight = 1f;
-            _vrik.solver.leftArm.shoulderTwistWeight = 1f;
             
             _vrik.solver.rightArm.positionWeight = 1f;
             _vrik.solver.rightArm.rotationWeight = 1f;
-            _vrik.solver.rightArm.shoulderRotationWeight = 1f;
-            _vrik.solver.rightArm.shoulderTwistWeight = 1f;
             
             // Spine settings for better posture
             _vrik.solver.spine.pelvisPositionWeight = 0f; // Don't track pelvis directly
@@ -1077,6 +1114,7 @@ namespace Vertigo2Multiplayer
             }
             
             Plugin.Log.LogInfo($"[VRIK] Solver initiated after init: {_vrik.solver.initiated}");
+            Plugin.Log.LogInfo($"[VRIK] Preserved hand rig settings: L shoulder={_vrik.solver.leftArm.shoulderRotationWeight:F2}, twist={_vrik.solver.leftArm.shoulderTwistWeight:F2}, palm axis={_vrik.solver.leftArm.palmToThumbAxis}; R shoulder={_vrik.solver.rightArm.shoulderRotationWeight:F2}, twist={_vrik.solver.rightArm.shoulderTwistWeight:F2}, palm axis={_vrik.solver.rightArm.palmToThumbAxis}");
             Plugin.Log.LogInfo($"[VRIK] Configured for {PlayerName}");
             Plugin.Log.LogInfo($"[VRIK] ========================================");
         }
@@ -1239,6 +1277,10 @@ namespace Vertigo2Multiplayer
         private void LateUpdate()
         {
             if (!_usingRealModel || _playerModel == null) return;
+
+            // Apply after the body's IK pass so each hand retains the exact
+            // weapon-aware pose produced by the remote player's game.
+            ApplyNetworkHandPose();
             
             // Fix head visibility AFTER HideLegs runs (HideLegs uses LateUpdate)
             // This ensures the head stays visible for remote players
@@ -1530,18 +1572,35 @@ namespace Vertigo2Multiplayer
             CurrentWeapon = weaponId;
         }
 
-        public void OnWeaponFire(string weaponId, Vector3 direction)
+        public void OnWeaponFire(string weaponId, Vector3 position, Vector3 direction)
         {
-            Plugin.Log.LogInfo($"[WEAPON VISUAL] {PlayerName} fired {weaponId}, showing muzzle flash");
+            Plugin.Log.LogInfo($"[WEAPON VISUAL] {PlayerName} fired {weaponId} at {position}");
+
+            var profile = VertigoPlayer.instance?.equippablesManager?.GetEquippableByName(weaponId);
+            var gun = profile?.prefab != null ? profile.prefab.GetComponentInChildren<Gun>(true) : null;
+            if (gun?.clips != null && gun.clips.Length > 0)
+            {
+                var clip = gun.clips[Random.Range(0, gun.clips.Length)];
+                if (clip != null)
+                    AudioSource.PlayClipAtPoint(clip, position, 2f);
+            }
             
             if (_muzzleFlash != null)
             {
-                _muzzleFlash.Play();
-                var light = _muzzleFlash.GetComponent<Light>();
+                Quaternion rotation = direction.sqrMagnitude > 0.0001f
+                    ? Quaternion.LookRotation(direction)
+                    : _muzzleFlash.transform.rotation;
+                GameObject flashObject = Instantiate(_muzzleFlash.gameObject, position, rotation);
+                ParticleSystem flash = flashObject.GetComponent<ParticleSystem>();
+                flash?.Play();
+
+                var light = flashObject.GetComponent<Light>();
                 if (light != null)
                 {
                     StartCoroutine(FlashLight(light));
                 }
+
+                Destroy(flashObject, MUZZLE_FLASH_LIFETIME + MUZZLE_FLASH_DURATION);
             }
             else
             {
@@ -1609,8 +1668,78 @@ namespace Vertigo2Multiplayer
             ApplyGripToHands();
         }
 
+        public void SetHandPose(FingerBonePose[] left, FingerBonePose[] right)
+        {
+            int count = Vertigo2.Interaction.HandPose.numBones;
+            if (left == null || right == null || left.Length != count || right.Length != count)
+                return;
+
+            if (_hasNetworkHandPose)
+            {
+                System.Array.Copy(_leftFingerPose, _previousLeftFingerPose, count);
+                System.Array.Copy(_rightFingerPose, _previousRightFingerPose, count);
+                _previousHandPoseTime = _currentHandPoseTime;
+                _hasPreviousNetworkHandPose = true;
+            }
+            else
+            {
+                _previousHandPoseTime = Time.unscaledTime;
+                _hasPreviousNetworkHandPose = false;
+            }
+
+            System.Array.Copy(left, _leftFingerPose, count);
+            System.Array.Copy(right, _rightFingerPose, count);
+            _currentHandPoseTime = Time.unscaledTime;
+            _hasNetworkHandPose = true;
+
+            if (_handPoseDiagnosticCounter++ % 90 == 0)
+            {
+                Plugin.Log.LogInfo($"[HAND POSE RECV] {PlayerName}: left={_leftHandBones?[1]?.name ?? "missing"} " +
+                    $"q={left[1].LocalRotation.eulerAngles}, right={_rightHandBones?[1]?.name ?? "missing"} " +
+                    $"q={right[1].LocalRotation.eulerAngles}");
+            }
+        }
+
+        private void ApplyNetworkHandPose()
+        {
+            if (!_hasNetworkHandPose || !_handAnimationInitialized)
+                return;
+
+            float sampleTime = Time.unscaledTime - HAND_POSE_INTERPOLATION_DELAY;
+            float blend = 1f;
+            if (_hasPreviousNetworkHandPose)
+            {
+                float interval = _currentHandPoseTime - _previousHandPoseTime;
+                blend = interval > 0.0001f
+                    ? Mathf.Clamp01((sampleTime - _previousHandPoseTime) / interval)
+                    : 1f;
+            }
+
+            ApplyNetworkHandPoseToBones(_leftHandBones, _previousLeftFingerPose, _leftFingerPose, blend);
+            ApplyNetworkHandPoseToBones(_rightHandBones, _previousRightFingerPose, _rightFingerPose, blend);
+        }
+
+        private static void ApplyNetworkHandPoseToBones(Transform[] handBones,
+            FingerBonePose[] previousPose, FingerBonePose[] currentPose, float blend)
+        {
+            if (handBones == null)
+                return;
+
+            int count = Mathf.Min(Vertigo2.Interaction.HandPose.numBones, handBones.Length);
+            for (int i = 1; i < count; i++)
+            {
+                if (handBones[i] == null)
+                    continue;
+
+                handBones[i].localPosition = Vector3.Lerp(previousPose[i].LocalPosition,
+                    currentPose[i].LocalPosition, blend);
+                handBones[i].localRotation = Quaternion.Slerp(previousPose[i].LocalRotation,
+                    currentPose[i].LocalRotation, blend);
+            }
+        }
+
         /// <summary>
-        /// Apply grip values to hand bones
+        /// Apply legacy grip values to hand bones
         /// </summary>
         private void ApplyGripToHands()
         {
@@ -1705,6 +1834,19 @@ namespace Vertigo2Multiplayer
                 _rightWeaponId = rightWeaponId;
                 UpdateWeaponVisual(false, rightWeaponId);
             }
+        }
+
+        public bool HasEquippedWeapon(string weaponId)
+        {
+            if (string.IsNullOrEmpty(weaponId)) return false;
+            return string.Equals(_leftWeaponId, weaponId, System.StringComparison.OrdinalIgnoreCase) ||
+                   string.Equals(_rightWeaponId, weaponId, System.StringComparison.OrdinalIgnoreCase);
+        }
+
+        public void UpdateWeaponAmmo(string weaponId, int rounds, int capacity)
+        {
+            if (string.IsNullOrEmpty(weaponId)) return;
+            _weaponAmmo[weaponId] = new RemoteWeaponAmmo { Rounds = rounds, Capacity = capacity };
         }
 
         /// <summary>
@@ -1928,6 +2070,7 @@ namespace Vertigo2Multiplayer
             _rightClosedBonePositions = null;
             _rightClosedBoneRotations = null;
             _handAnimationInitialized = false;
+            _hasNetworkHandPose = false;
         }
         
         private PlayableCharacter FindCharacterById(string id)

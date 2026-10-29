@@ -112,8 +112,13 @@ namespace Vertigo2Multiplayer.Patches
             private static bool _eventRegistered = false;
             
             [HarmonyPostfix]
-            public static void Postfix()
+            public static void Postfix(Shooter __instance)
             {
+                if (__instance != null)
+                {
+                    __instance.OnInstantateBullet += bullet => OnPlayerBulletCreated(__instance, bullet);
+                }
+
                 if (!_eventRegistered)
                 {
                     Shooter.OnAnyShoot += OnShooterFired;
@@ -132,14 +137,38 @@ namespace Vertigo2Multiplayer.Patches
                 }
                 
                 var equippable = shooter.GetComponentInParent<Equippable>();
-                string weaponId = equippable != null ? equippable.GetType().Name : "Unknown";
+                string weaponId = WeaponSync.GetWeaponId(equippable);
                 Vector3 direction = shooter.transform.forward;
                 Vector3 position = shooter.transform.position;
                 
                 Plugin.Log.LogInfo($"[WEAPON FIRE] Local player fired: {weaponId} dir={direction} pos={position}");
                 
-                var packet = PacketBuilder.WeaponFire(weaponId, direction);
+                var packet = PacketBuilder.WeaponFire(weaponId, position, direction);
                 NetworkManager.Instance.Broadcast(packet, reliable: false);
+            }
+
+            private static void OnPlayerBulletCreated(Shooter shooter, Bullet bullet)
+            {
+                var network = NetworkManager.Instance;
+                if (network == null || !network.IsConnected || shooter == null || bullet == null || !shooter.playerControlled)
+                    return;
+
+                var equippable = shooter.GetComponentInParent<Equippable>();
+                string weaponId = WeaponSync.GetWeaponId(equippable);
+                if (string.IsNullOrEmpty(weaponId) || weaponId == "unknown")
+                    return;
+
+                // Clients render their own projectile locally, while the host
+                // creates the authoritative copy that can damage enemies.
+                if (!network.IsHost)
+                    WeaponSync.MarkVisualOnly(bullet);
+
+                byte shooterIndex = WeaponSync.GetShooterIndex(equippable, shooter);
+                var packet = PacketBuilder.ProjectileSpawn(weaponId, shooterIndex,
+                    bullet.transform.position, bullet.transform.forward,
+                    bullet.modifier.powerMultiplier, bullet.modifier.speedMultiplier,
+                    bullet.modifier.rangeMultiplier, bullet.speed);
+                network.Broadcast(packet, reliable: true);
             }
         }
 
